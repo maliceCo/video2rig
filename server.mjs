@@ -1,8 +1,10 @@
 // Prompt2Rig — tiny zero-dependency server.
 // Serves ./public and proxies fal.ai so the API key never reaches the browser.
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +22,12 @@ if (fs.existsSync(envFile)) {
 const FAL_KEY = process.env.FAL_KEY;
 const PORT = Number(process.env.PORT || 5177);
 const HQ_URL = process.env.HQ_URL || 'http://127.0.0.1:5178';
+const UPLOADS = path.resolve(process.env.P2R_UPLOAD_DIR || path.join(ROOT, 'hq', 'cache', 'uploads'));
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 250);
+if (!Number.isSafeInteger(MAX_UPLOAD_MB) || MAX_UPLOAD_MB < 1 || !Number.isSafeInteger(MAX_UPLOAD_MB * 1024 * 1024)) {
+  throw new Error('MAX_UPLOAD_MB must be a positive safe integer');
+}
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 if (!FAL_KEY) console.warn('[prompt2rig] FAL_KEY is not set — generation will fail. Put it in .env');
 
 const VIDEO_MODELS = {
@@ -70,15 +78,170 @@ async function falRun(model, input) {
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0; const chunks = [];
-    req.on('data', (c) => { size += c.length; if (size > 25e6) reject(new Error('body too large')); else chunks.push(c); });
-    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString() || '{}')); } catch (e) { reject(e); } });
+    req.on('data', (c) => { size += c.length; if (size > 25e6) reject(Object.assign(new Error('body too large'), { status: 413 })); else chunks.push(c); });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString() || '{}')); }
+      catch (e) { reject(Object.assign(e, { status: 400 })); }
+    });
     req.on('error', reject);
   });
 }
 
 function send(res, status, body) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
   res.end(JSON.stringify(body));
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+function isLoopbackAddress(address) {
+  const normalized = String(address || '').toLowerCase().replace(/^::ffff:/, '');
+  return normalized === '::1' || normalized === 'localhost' || normalized.startsWith('127.');
+}
+
+function isLocalHost(hostname) {
+  return LOCAL_HOSTS.has(String(hostname || '').toLowerCase().replace(/^\[|\]$/g, ''));
+}
+
+function localRequestAllowed(req) {
+  if (!isLoopbackAddress(req.socket.remoteAddress)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try { return isLocalHost(new URL(origin).hostname); } catch { return false; }
+}
+
+function localWorkerConfigured() {
+  try { return isLocalHost(new URL(HQ_URL).hostname); } catch { return false; }
+}
+
+function uploadPath(id, extension = '.bin') {
+  if (!UUID_RE.test(id)) return null;
+  return path.join(UPLOADS, id.toLowerCase() + extension);
+}
+
+function endAndCloseRequest(req, res, status, body) {
+  req.pause();
+  res.shouldKeepAlive = false;
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'X-Content-Type-Options': 'nosniff',
+    Connection: 'close',
+  });
+  res.end(JSON.stringify(body));
+}
+
+async function receiveUpload(req, res) {
+  if (!localRequestAllowed(req)) return send(res, 403, { error: 'local uploads are only available from this computer' });
+
+  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+  if (contentType !== 'application/octet-stream' && !/^video\/[a-z0-9.+-]+$/.test(contentType)) {
+    return send(res, 415, { error: 'send a video/* or application/octet-stream body' });
+  }
+
+  const rawLength = req.headers['content-length'];
+  let tooLarge = false;
+  if (rawLength != null) {
+    if (!/^\d+$/.test(rawLength)) return send(res, 400, { error: 'invalid Content-Length' });
+    tooLarge = Number(rawLength) > MAX_UPLOAD_BYTES;
+  }
+
+  const id = crypto.randomUUID();
+  const partial = uploadPath(id, '.part');
+  const complete = uploadPath(id);
+  let file;
+  let size = 0;
+  try {
+    await fs.promises.mkdir(UPLOADS, { recursive: true });
+    if (!tooLarge) file = await fs.promises.open(partial, 'wx', 0o600);
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (tooLarge) continue;
+      if (size > MAX_UPLOAD_BYTES) {
+        tooLarge = true;
+        await file.close();
+        file = null;
+        await fs.promises.unlink(partial).catch(() => {});
+        continue;
+      }
+      let offset = 0;
+      while (offset < chunk.length) {
+        const written = await file.write(chunk, offset, chunk.length - offset);
+        if (!written.bytesWritten) throw new Error('could not write uploaded video');
+        offset += written.bytesWritten;
+      }
+    }
+    if (file) {
+      await file.close();
+      file = null;
+    }
+    if (tooLarge) {
+      await fs.promises.unlink(partial).catch(() => {});
+      return endAndCloseRequest(req, res, 413, { error: `video exceeds the ${MAX_UPLOAD_MB} MiB upload limit` });
+    }
+    if (size === 0) {
+      await fs.promises.unlink(partial).catch(() => {});
+      return send(res, 400, { error: 'video upload is empty' });
+    }
+    await fs.promises.rename(partial, complete);
+    console.log(`[upload] ${id} ${size} bytes`);
+    return send(res, 201, { upload_id: id, bytes: size });
+  } catch (err) {
+    if (file) await file.close().catch(() => {});
+    await fs.promises.unlink(partial).catch(() => {});
+    if (req.aborted || res.destroyed) return;
+    console.error('[upload error]', err.message);
+    return send(res, 500, { error: 'could not store video upload' });
+  }
+}
+
+async function serveUpload(req, res, id) {
+  if (!localRequestAllowed(req)) return send(res, 403, { error: 'local uploads are only available from this computer' });
+  const file = uploadPath(id);
+  if (!file) return send(res, 404, { error: 'upload not found' });
+  let stat;
+  try { stat = await fs.promises.lstat(file); } catch { return send(res, 404, { error: 'upload not found' }); }
+  if (!stat.isFile()) return send(res, 404, { error: 'upload not found' });
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'Content-Length': stat.size,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  const stream = fs.createReadStream(file);
+  stream.on('error', (err) => {
+    console.error('[upload read error]', err.message);
+    if (!res.headersSent) send(res, 500, { error: 'could not read uploaded video' });
+    else res.destroy(err);
+  });
+  stream.pipe(res);
+}
+
+function requestWorker(body) {
+  const target = new URL(`${HQ_URL.replace(/\/+$/, '')}/process`);
+  const transport = target.protocol === 'https:' ? https : target.protocol === 'http:' ? http : null;
+  if (!transport) return Promise.reject(new Error('HQ_URL must use http or https'));
+  const payload = Buffer.from(JSON.stringify(body));
+  return new Promise((resolve, reject) => {
+    const upstream = transport.request(target, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length },
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('error', reject);
+      response.on('end', () => resolve({ status: response.statusCode || 502, type: response.headers['content-type'], body: Buffer.concat(chunks) }));
+    });
+    upstream.on('error', reject);
+    upstream.end(payload);
+  });
+}
+
+let hqQueue = Promise.resolve();
+function queueHQ(task) {
+  const result = hqQueue.then(task, task);
+  hqQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 const MIME = {
@@ -89,6 +252,10 @@ const MIME = {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   try {
+    if (url.pathname === '/api/uploads' && req.method === 'POST') return await receiveUpload(req, res);
+    const uploadMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)$/);
+    if (uploadMatch && req.method === 'GET') return await serveUpload(req, res, uploadMatch[1]);
+
     if (req.method === 'POST' && url.pathname === '/api/video') {
       const b = await readJson(req);
       const model = VIDEO_MODELS[b.model] ? b.model : 'h3';
@@ -135,13 +302,40 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/hq') {
       const b = await readJson(req);
-      const r = await fetch(`${HQ_URL}/process`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_url: b.video_url, ...(b.hands ? { hands: b.hands } : {}) }),
+      if (!b || typeof b !== 'object' || Array.isArray(b)) return send(res, 400, { error: 'HQ request must be a JSON object' });
+      const hasUpload = Object.hasOwn(b, 'upload_id');
+      const hasUrl = Object.hasOwn(b, 'video_url');
+      if (hasUpload === hasUrl) return send(res, 400, { error: 'provide exactly one of upload_id or video_url' });
+
+      let videoUrl;
+      if (hasUpload) {
+        if (typeof b.upload_id !== 'string' || !uploadPath(b.upload_id)) return send(res, 400, { error: 'invalid upload_id' });
+        if (!localWorkerConfigured()) return send(res, 400, { error: 'local video uploads require an HQ worker on this computer' });
+        try { await fs.promises.access(uploadPath(b.upload_id)); }
+        catch { return send(res, 404, { error: 'uploaded video not found; select the file again' }); }
+        const address = server.address();
+        if (!address || typeof address === 'string') return send(res, 503, { error: 'web server is not ready to serve the uploaded video' });
+        videoUrl = `http://127.0.0.1:${address.port}/api/uploads/${b.upload_id.toLowerCase()}`;
+      } else {
+        if (typeof b.video_url !== 'string') return send(res, 400, { error: 'video_url must be an http(s) URL' });
+        let parsed;
+        try { parsed = new URL(b.video_url); } catch { return send(res, 400, { error: 'video_url must be an http(s) URL' }); }
+        if (!['http:', 'https:'].includes(parsed.protocol)) return send(res, 400, { error: 'video_url must be an http(s) URL' });
+        videoUrl = parsed.href;
+      }
+
+      if (b.hands != null && !['off', 'auto', 'wilor', 'mediapipe'].includes(b.hands)) {
+        return send(res, 400, { error: 'hands must be off, auto, wilor, or mediapipe' });
+      }
+      const body = { video_url: videoUrl, ...(b.hands != null ? { hands: b.hands } : {}) };
+      let result;
+      try { result = await queueHQ(() => requestWorker(body)); }
+      catch (err) { throw Object.assign(err, { status: 502 }); }
+      res.writeHead(result.status, {
+        'Content-Type': result.type || 'application/json',
+        'X-Content-Type-Options': 'nosniff',
       });
-      const text = await r.text();
-      res.writeHead(r.status, { 'Content-Type': 'application/json' });
-      return res.end(text);
+      return res.end(result.body);
     }
 
     if (req.method === 'GET') {
@@ -158,8 +352,13 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(405); res.end();
   } catch (err) {
     console.error('[error]', err.message);
-    send(res, err.status && err.status < 600 ? err.status : 500, { error: err.message });
+    if (res.destroyed || req.aborted) return;
+    const status = err.status && err.status < 600 ? err.status : 500;
+    send(res, status, { error: err.message });
   }
 });
 
-server.listen(PORT, () => console.log(`Prompt2Rig → http://localhost:${PORT}`));
+server.listen(PORT, () => {
+  const address = server.address();
+  console.log(`Prompt2Rig → http://localhost:${typeof address === 'object' && address ? address.port : PORT}`);
+});

@@ -198,8 +198,10 @@ class Take {
   constructor(prompt) {
     this.id = ++takeSeq; this.prompt = prompt;
     this.videoUrl = null; this.status = 'generating';
+    this.sourceKind = 'generated'; this.sourceFile = null; this.uploadId = null; this.uploadPromise = null;
     this.live = null; this.liveDone = false;
     this.hq = null; this.hqRaw = null; this.hqStatus = 'off'; this.hqAt = 0;
+    this.hqBusy = false; this.hqError = ''; this.hqWarning = ''; this.hqHandsMethod = null;
     this.rootOffset = null; this.timings = {};
     this.ready = new Promise((r) => (this._resolveReady = r));
   }
@@ -216,11 +218,24 @@ function renderTakes() {
       : t.status === 'skipped' ? '<span class="pill">skipped</span>'
       : t.timings.gen ? `<span class="pill">${t.timings.gen.toFixed(1)}s gen</span>` : '';
     const live = t.liveDone ? '<span class="pill">live</span>' : '';
-    const hq = { running: '<span class="pill busy">hq</span>', done: `<span class="pill ok">hq ${t.timings.hq?.toFixed(1)}s</span>`, error: '<span class="pill bad">hq failed</span>' }[t.hqStatus] || '';
+    const hq = {
+      uploading: '<span class="pill busy">uploading</span>',
+      running: '<span class="pill busy">hq processing</span>',
+      done: `<span class="pill ok">hq ${t.timings.hq?.toFixed(1)}s</span>`,
+      error: '<span class="pill bad">hq failed</span>',
+    }[t.hqStatus] || '';
+    const handsWarning = t.hqWarning ? '<span class="pill bad" title="Hand model unavailable; body motion is still HQ">hands unavailable</span>' : '';
+    const localHqBusy = t.sourceKind === 'file' && t.hqBusy;
+    const hqLabel = t.hqStatus === 'done' ? 'reprocess hq' : t.hqStatus === 'error' ? 'retry hq' : 'process hq';
+    const hqButton = t.sourceKind === 'file'
+      ? `<button class="btn" data-a="hq" ${localHqBusy || !hqOnline ? 'disabled' : ''} title="${!hqOnline ? 'HQ worker offline' : ''}">${hqLabel}</button>` : '';
+    const best = t.best;
     card.innerHTML = `<div class="p" title="${escapeHtml(t.prompt)}">#${t.id} · ${t.auto ? '<i style="color:var(--dim)">idle</i> · ' : ''}${escapeHtml(t.prompt)}</div>
-      <div class="meta">${gen}${live}${hq}</div>
-      <div class="actions"><button class="btn" data-a="play" ${t.videoUrl ? '' : 'disabled'}>▶ play</button>
-      <button class="btn" data-a="glb" ${t.best ? '' : 'disabled'}>↓ glb</button></div>`;
+      <div class="meta">${gen}${live}${hq}${handsWarning}</div>
+      ${t.hqError ? `<div class="note" title="${escapeHtml(t.hqError)}">${escapeHtml(t.hqError)}</div>` : ''}
+      <div class="actions">${hqButton}<button class="btn" data-a="play" ${t.videoUrl ? '' : 'disabled'}>▶ play</button>
+      <button class="btn" data-a="glb" ${!best || localHqBusy ? 'disabled' : ''}>↓ glb</button></div>`;
+    card.querySelector('[data-a=hq]')?.addEventListener('click', () => runHQ(t));
     card.querySelector('[data-a=play]').onclick = () => playTake(t);
     card.querySelector('[data-a=glb]').onclick = () => exportTake(t);
     el.appendChild(card);
@@ -258,6 +273,8 @@ let genBusy = 0;
 
 /** Stream mode: keep one clip in the pipeline so the performer never freezes for long. */
 function maybeIdle() {
+  if (current?.sourceKind === 'file' || queue.some((t) => t.sourceKind === 'file')
+    || takes.some((t) => t.sourceKind === 'file' && t.awaitingHq && t.hqBusy)) return;
   if (!settings.stream || idleStreak >= MAX_IDLE_STREAK) return;
   const ahead = queue.length + genBusy + takes.filter((t) => t.status === 'ready' && t.hqStatus === 'running' && !t.started).length;
   if (ahead === 0) { idleStreak++; submitPrompt(IDLE_PROMPT, { auto: true }); }
@@ -335,29 +352,106 @@ let hqOnline = false;
 async function checkHQ() {
   try { const r = await api('/api/hq/health'); hqOnline = !!r.ok; pill('hq', r.ok ? `hq · ${(r.device || 'ready').replace(/^NVIDIA GeForce /, '').toLowerCase()}` : 'hq · ' + (r.error || 'not ready'), r.ok ? 'ok' : 'bad'); }
   catch { hqOnline = false; pill('hq', 'hq worker offline', 'bad'); }
+  renderTakes();
+}
+
+function validateHqResult(r) {
+  const n = r?.n, fps = r?.fps;
+  if (!Number.isInteger(n) || n < 1 || !Number.isFinite(fps) || fps <= 0) throw new Error('HQ worker returned invalid frame count or FPS');
+  for (const [key, length] of [['global_orient', n * 3], ['body_pose', n * 63], ['transl', n * 3]]) {
+    if (!Array.isArray(r[key]) || r[key].length !== length || !r[key].every(Number.isFinite)) {
+      throw new Error(`HQ worker returned invalid ${key} data`);
+    }
+  }
+  if (!Number.isFinite(r.leg_length) || r.leg_length <= 0) throw new Error('HQ worker returned invalid leg length');
+}
+
+function validHqHands(hands, n) {
+  if (!hands || typeof hands !== 'object') return false;
+  return ['R', 'L'].every((side) => {
+    const hand = hands[side];
+    return hand && Array.isArray(hand.kp) && hand.kp.length === n * 63 && hand.kp.every(Number.isFinite)
+      && Array.isArray(hand.valid) && hand.valid.length === n && hand.valid.every((v) => v === 0 || v === 1 || v === true || v === false);
+  });
+}
+
+async function ensureUploaded(take) {
+  if (take.uploadId) return take.uploadId;
+  if (take.uploadPromise) return take.uploadPromise;
+  if (!(take.sourceFile instanceof File)) throw new Error('the original local video is no longer available; select the file again');
+  take.uploadPromise = (async () => {
+    const response = await fetch('/api/uploads', {
+      method: 'POST',
+      headers: { 'Content-Type': take.sourceFile.type || 'application/octet-stream' },
+      body: take.sourceFile,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `video upload failed (${response.status})`);
+    if (typeof result.upload_id !== 'string' || !Number.isSafeInteger(result.bytes) || result.bytes !== take.sourceFile.size) {
+      throw new Error('server returned an invalid upload receipt');
+    }
+    take.uploadId = result.upload_id;
+    return take.uploadId;
+  })().catch((error) => {
+    take.uploadPromise = null;
+    throw error;
+  });
+  return take.uploadPromise;
 }
 
 function runHQ(take) {
+  if (take.hqBusy) return take.hqPromise;
   const t0 = performance.now();
-  take.hqStatus = 'running'; renderTakes();
-  take.hqPromise = api('/api/hq', { video_url: take.videoUrl, ...(take.handsMethod ? { hands: take.handsMethod } : {}) })
-    .then((r) => {
-      take.hqRaw = r; take.hq = bakeSmpl(r); take.hqAt = performance.now();
-      take.hqStatus = 'done'; take.timings.hq = (performance.now() - t0) / 1000;
-      log(`#${take.id} hq motion in ${take.timings.hq.toFixed(1)}s (${r.n} frames, worker ${r.elapsed?.toFixed(1)}s)`, 'hq');
-    })
-    .catch((e) => { take.hqStatus = 'error'; log(`#${take.id} hq failed: ${e.message}`, 'err'); })
-    .finally(renderTakes);
+  take.hqBusy = true;
+  take.hqError = '';
+  take.hqWarning = '';
+  take.hqHandsMethod = take.handsMethod || (settings.hands ? 'auto' : 'off');
+  take.hqStatus = take.sourceKind === 'file' && !take.uploadId ? 'uploading' : 'running';
+  renderTakes();
+
+  const work = (async () => {
+    const request = take.sourceKind === 'file'
+      ? { upload_id: await ensureUploaded(take), hands: take.hqHandsMethod }
+      : { video_url: take.videoUrl, hands: take.hqHandsMethod };
+    take.hqStatus = 'running';
+    renderTakes();
+    const result = await api('/api/hq', request);
+    validateHqResult(result);
+    if (result.hands != null && !validHqHands(result.hands, result.n)) result.hands = null;
+    const baked = bakeSmpl(result, take.hqHandsMethod !== 'off');
+    take.hqRaw = result;
+    take.hq = baked;
+    take.hqAt = performance.now();
+    take.hqStatus = 'done';
+    take.timings.hq = (performance.now() - t0) / 1000;
+    if (take.hqHandsMethod !== 'off' && !result.hands) {
+      take.hqWarning = 'HQ body motion is ready, but hand tracking was unavailable.';
+      log(`#${take.id} hq body ready; finger tracking unavailable`, 'err');
+    } else {
+      log(`#${take.id} hq motion in ${take.timings.hq.toFixed(1)}s (${result.n} frames, worker ${Number.isFinite(result.elapsed) ? result.elapsed.toFixed(1) : '?'}s)`, 'hq');
+    }
+    return result;
+  })().catch((error) => {
+    take.hqStatus = 'error';
+    take.hqError = error.message;
+    log(`#${take.id} hq failed: ${error.message}`, 'err');
+    return null;
+  }).finally(() => {
+    take.hqBusy = false;
+    renderTakes();
+  });
+  take.hqPromise = work;
+  return work;
 }
 
 // Finger tracking from the HQ worker: per hand, 21 wrist-relative keypoints per frame (GVHMR world axes).
 const _kp = Array.from({ length: 21 }, () => new THREE.Vector3());
-function applyHandsFrame(hands, f, yawFix) {
+function applyHandsFrame(hands, f, yawFix, handsEnabled = settings.hands) {
   // WiLoR's MANO hands are anatomically valid already; joint limits only help MediaPipe's noisy depth.
   HAND_LIMITS.enabled = hands?.method !== 'wilor';
   for (const [src, side] of [['R', 'Right'], ['L', 'Left']]) {
     const h = hands?.[src];
-    if (settings.hands !== false && h?.valid[f]) {
+    if (handsEnabled && h?.valid[f]) {
       const o = f * 63;
       for (let j = 0; j < 21; j++) _kp[j].set(h.kp[o + j * 3], h.kp[o + j * 3 + 1], h.kp[o + j * 3 + 2]).applyQuaternion(yawFix);
       rig.applyHand(side, _kp);
@@ -366,7 +460,7 @@ function applyHandsFrame(hands, f, yawFix) {
 }
 
 /** GVHMR SMPL params → Track of Mixamo local rotations + grounded hips path. */
-function bakeSmpl(r) {
+function bakeSmpl(r, handsEnabled = settings.hands) {
   const { n, fps, global_orient: GO, body_pose: BP, transl: T, leg_length } = r;
   // Heading: turn GVHMR's world so the character faces the viewer the way the person faces the
   // camera (from the in-camera orientation). Chained clips share the camera, so headings line up.
@@ -388,7 +482,7 @@ function bakeSmpl(r) {
     d.set(T[f * 3] - T[0], T[f * 3 + 1] - T[1], T[f * 3 + 2] - T[2]).applyQuaternion(yawFix).multiplyScalar(scale);
     const p = rig.rest.Hips.wp.clone().add(d);
     rig.setHipsWorld(p);
-    applyHandsFrame(r.hands, f, yawFix);
+    applyHandsFrame(r.hands, f, yawFix, handsEnabled);
     lows.push(rig.lowestFoot());
     track.push(f / fps, rig.snapshot());
   }
@@ -430,7 +524,7 @@ function enqueue(take) {
 
 /** Out of HQ-ready clips: start the next generated one now on the live pass instead of freezing. */
 function startStarved() {
-  const next = takes.find((t) => t.awaitingHq && t.status === 'ready' && !t.started);
+  const next = takes.find((t) => t.sourceKind !== 'file' && t.awaitingHq && t.status === 'ready' && !t.started);
   if (!next) return false;
   next.awaitingHq = false;
   log(`#${next.id} starting on live preview (hq still running)`);
@@ -448,7 +542,9 @@ function playTake(take) {
   const prev = current;
   current = take;
   const qi = queue.indexOf(take); if (qi >= 0) queue.splice(qi, 1);
-  if (!take.rootOffset) {
+  if (take.sourceKind === 'file') {
+    take.rootOffset = new THREE.Vector3();
+  } else if (!take.rootOffset) {
     take.rootOffset = new THREE.Vector3();
     if (chainOn() && prev && rig) {
       take.rootOffset.set(lastRenderedHips.x - rig.rest.Hips.wp.x, 0, lastRenderedHips.z - rig.rest.Hips.wp.z);
@@ -478,7 +574,7 @@ video.addEventListener('ended', () => {
     renderTakes();
   }
   if (queue.length) playNext();
-  else if (settings.stream) { held = true; if (!startStarved()) maybeIdle(); } // freeze on the last frame
+  else if (settings.stream && current?.sourceKind !== 'file') { held = true; if (!startStarved()) maybeIdle(); } // freeze on the last generated frame
   else { video.currentTime = 0; video.play().catch(() => {}); }
 });
 
@@ -667,12 +763,71 @@ $('#file-char').onchange = (e) => {
   const url = URL.createObjectURL(f);
   loadCharacter(url, f.name).catch((err) => { log('character failed: ' + err.message, 'err'); pill('rig', 'character failed', 'bad'); });
 };
+
+async function inspectLocalVideo(file) {
+  if (!file.size) throw new Error('the selected video is empty');
+  const url = URL.createObjectURL(file);
+  const probe = document.createElement('video');
+  probe.preload = 'metadata';
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('could not read video metadata; try an MP4 encoded with H.264')), 15000);
+      probe.onloadedmetadata = () => {
+        clearTimeout(timeout);
+        if (!Number.isFinite(probe.duration) || probe.duration <= 0 || probe.videoWidth <= 0 || probe.videoHeight <= 0) {
+          reject(new Error('video has invalid duration or dimensions'));
+        } else resolve();
+      };
+      probe.onerror = () => { clearTimeout(timeout); reject(new Error('browser cannot decode this video; try an MP4 encoded with H.264')); };
+      probe.src = url;
+    });
+    return url;
+  } catch (error) {
+    URL.revokeObjectURL(url);
+    throw error;
+  } finally {
+    probe.removeAttribute('src');
+    probe.load();
+  }
+}
+
 $('#btn-vid').onclick = () => $('#file-vid').click();
-$('#file-vid').onchange = (e) => {
+$('#file-vid').onchange = async (e) => {
   const f = e.target.files[0]; if (!f) return;
+  e.target.value = '';
+  let videoUrl;
+  try { videoUrl = await inspectLocalVideo(f); }
+  catch (error) { log(`video file rejected: ${error.message}`, 'err'); return; }
+
   const take = new Take(`(file) ${f.name}`);
-  take.videoUrl = URL.createObjectURL(f); take.status = 'ready'; take.timings.gen = 0;
-  takes.push(take); renderTakes(); enqueue(take);
+  take.sourceKind = 'file';
+  take.sourceFile = f;
+  take.videoUrl = videoUrl;
+  take.status = 'ready';
+  take.timings.gen = 0;
+  takes.push(take);
+  renderTakes();
+
+  if (settings.hq) {
+    if (hqOnline) {
+      const hqPromise = runHQ(take);
+      if (settings.waitHq) {
+        take.awaitingHq = true;
+        renderTakes();
+        banner(`#${take.id}: waiting for hq motion…`);
+        hqPromise.finally(() => {
+          take.awaitingHq = false;
+          banner('');
+          playTake(take); // On HQ failure, playTake keeps the live MediaPipe fallback.
+        });
+      } else playTake(take);
+    } else {
+      take.hqStatus = 'error';
+      take.hqError = 'HQ worker offline; using live preview.';
+      log(`#${take.id} hq worker offline; using live preview`, 'err');
+      playTake(take);
+    }
+  } else playTake(take);
 };
 
 // ---- capture zoom: glide the 3D camera onto a hand and zoom the video panel onto the same hand ----

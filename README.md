@@ -58,7 +58,7 @@ forearms. WiLoR adds the palm and all 15 finger joints per hand.
 
 ## Quick start
 
-**Needs:** Node 18+ and a [fal](https://fal.ai) API key. For the HQ pass: Windows, an NVIDIA GPU,
+**Needs:** Node 18+. A [fal](https://fal.ai) API key is needed only to generate videos or performer images from prompts. For the HQ pass: Windows, an NVIDIA GPU,
 [`uv`](https://docs.astral.sh/uv/) and `ffmpeg` on PATH.
 
 ```bash
@@ -103,6 +103,12 @@ hq\.venv\Scripts\python hq\worker.py    # → 127.0.0.1:5178, loads once and sta
 - **Swap character every loop**, **cinematic camera**, portrait or landscape clips.
 - **↓ glb** on any take exports the skinned character with its animation, and keeps a copy plus the source clip's URL in `takes/`.
 
+### Use a local video
+
+Choose **use a video file…** to retarget a clip from your computer. With **HQ pass** enabled, the app uploads the clip to the local web server and sends it to the local GVHMR worker; this path does not use fal. The live MediaPipe preview remains available while HQ runs, and **hold playback until hq is ready** waits for the result. Each take has **process hq / retry hq / reprocess hq** and **↓ glb** actions. If HQ fails, the live result remains available as a fallback.
+
+Local video uploads are stored under `hq/cache/uploads/` and are not automatically deleted. The default upload limit is 250 MiB; set `MAX_UPLOAD_MB` in `.env` to a different positive whole number. Imported clips are not limited by the prompt-generation duration slider, but longer clips use more memory and GPU time. The HQ pipeline is tuned for one visible person and a mostly fixed camera. Browser preview still needs the app's external browser assets/models to load. HQ components retain their third-party license restrictions described below.
+
 **Prompts that retarget well** face the camera with the limbs clear of the body: dances, kicks, kata, sport mimes,
 celebrations, clear hand shapes. Flips, spins, floor work and crossed or hidden arms confuse any single-camera pose
 estimator; the presets and the prompt template steer away from them.
@@ -125,11 +131,26 @@ node tools/capture.mjs --prompts tools/prompts_dynamic.txt --character xbot --ou
 node tools/capture.mjs --clip <video url> --prompt "..." --passes 2 --zoom 5.2-10.0 --zoom-bone RightHand
 ```
 
+## Tests
+
+The upload and HQ proxy tests use temporary directories and a simulated worker; they do not call fal or use the GPU:
+
+```bash
+node --test tests/upload-hq.test.mjs
+```
+
+The browser integration test also uses a simulated worker and verifies local import, stream-mode behavior, HQ retry, and GLB export. Set `P2R_BROWSER_EXECUTABLE` to a local Chrome/Edge executable path to run it:
+
+```powershell
+$env:P2R_BROWSER_EXECUTABLE = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+node --test tests/upload-hq.browser.test.mjs
+```
+
 ## Project layout
 
 | Path | |
 |---|---|
-| `server.mjs` | zero-dependency server; proxies fal (the key stays server-side) and the HQ worker |
+| `server.mjs` | zero-dependency server; proxies fal (the key stays server-side), local video uploads, and the HQ worker |
 | `public/app.js` | UI, generation queue, live pose loop, playback and blending, stream mode, GLB export, capture hooks |
 | `public/stage.js` | the stage: lighting, reflective floor, contact shadows, cinematic camera |
 | `public/retarget.js` | Mixamo rig: MediaPipe landmarks → bones, SMPL rotations → bones, fingers, rig-to-rig pose copy |
