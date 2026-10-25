@@ -41,6 +41,7 @@ async function startWebServer() {
       ...process.env,
       FAL_KEY: '',
       HQ_URL: `http://127.0.0.1:${workerPort}`,
+      HQ_PYTHON: path.join(tempDir, 'missing-python'),
       MAX_UPLOAD_MB: '1',
       P2R_UPLOAD_DIR: uploadDir,
       PORT: '0',
@@ -176,6 +177,25 @@ test('upload rejects empty, invalid MIME, invalid origin, unknown IDs, and malfo
   assert.equal(nullBody.status, 400);
   const invalidJson = await fetch(`${webOrigin}/api/hq`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' });
   assert.equal(invalidJson.status, 400);
+});
+
+test('starting the HQ worker is local-only and does not duplicate a healthy worker', async () => {
+  const remote = await fetch(`${webOrigin}/api/hq/start`, {
+    method: 'POST',
+    headers: { Origin: 'https://attacker.invalid', 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(remote.status, 403);
+
+  const local = await fetch(`${webOrigin}/api/hq/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  assert.equal(local.status, 200);
+  const status = await local.json();
+  assert.equal(status.started, false);
+  assert.equal(status.ok, true);
 });
 
 test('upload limit returns 413 for declared and chunked oversized bodies and leaves no partial files', async () => {

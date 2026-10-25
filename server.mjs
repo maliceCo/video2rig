@@ -2,6 +2,7 @@
 // Serves ./public and proxies fal.ai so the API key never reaches the browser.
 import http from 'node:http';
 import https from 'node:https';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -29,6 +30,75 @@ if (!Number.isSafeInteger(MAX_UPLOAD_MB) || MAX_UPLOAD_MB < 1 || !Number.isSafeI
 }
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 if (!FAL_KEY) console.warn('[prompt2rig] FAL_KEY is not set — generation will fail. Put it in .env');
+
+let hqProcess = null;
+let hqLaunchError = null;
+
+function hqPythonPath() {
+  if (process.env.HQ_PYTHON) return path.resolve(ROOT, process.env.HQ_PYTHON);
+  return path.join(ROOT, 'hq', '.venv', process.platform === 'win32' ? 'Scripts' : 'bin', process.platform === 'win32' ? 'python.exe' : 'python');
+}
+
+async function startHqWorker(req, res) {
+  if (!localRequestAllowed(req)) return send(res, 403, { error: 'starting the HQ worker is only available from this computer' });
+  if (!localWorkerConfigured()) return send(res, 400, { error: 'HQ_URL must point to a worker on this computer' });
+
+  const target = new URL(HQ_URL);
+  if (target.protocol !== 'http:') return send(res, 400, { error: 'the local HQ worker must use http://' });
+  if (hqProcess && hqProcess.exitCode == null && !hqProcess.killed) {
+    return send(res, 202, { started: false, starting: true });
+  }
+  try {
+    const existing = await fetch(`${HQ_URL}/health`, { signal: AbortSignal.timeout(1000) });
+    const status = await existing.json();
+    if (existing.ok && typeof status?.ok === 'boolean') {
+      return send(res, 200, { started: false, ready: !!status.ok, ...status });
+    }
+  } catch {}
+
+  const python = hqPythonPath();
+  let pythonReady = false;
+  try { pythonReady = fs.statSync(python).isFile(); } catch {}
+  if (!pythonReady) {
+    const hint = process.env.HQ_PYTHON
+      ? `HQ_PYTHON does not exist: ${python}`
+      : `HQ Python environment not found at ${python}. Run hq/setup.ps1 on Windows, or set HQ_PYTHON in .env to your environment's Python executable.`;
+    return send(res, 400, { error: hint });
+  }
+
+  hqLaunchError = null;
+  const child = spawn(python, [path.join(ROOT, 'hq', 'worker.py')], {
+    cwd: path.join(ROOT, 'hq'),
+    env: { ...process.env, HQ_PORT: target.port || '80' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  hqProcess = child;
+
+  for (const [stream, label] of [[child.stdout, 'stdout'], [child.stderr, 'stderr']]) {
+    let pending = '';
+    stream.setEncoding('utf8');
+    stream.on('data', (chunk) => {
+      pending += chunk;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop();
+      for (const line of lines) if (line) console.log(`[hq ${label}] ${line}`);
+    });
+    stream.on('end', () => { if (pending) console.log(`[hq ${label}] ${pending}`); });
+  }
+
+  child.once('error', (error) => {
+    hqLaunchError = `could not start HQ worker: ${error.message}`;
+    console.error(`[hq] ${hqLaunchError}`);
+    if (hqProcess === child) hqProcess = null;
+  });
+  child.once('exit', (code, signal) => {
+    console.log(`[hq] worker exited (${signal || code})`);
+    hqLaunchError = `HQ worker exited (${signal || `code ${code}`})`;
+    if (hqProcess === child) hqProcess = null;
+  });
+  return send(res, 202, { started: true });
+}
 
 const VIDEO_MODELS = {
   // MiniMax H3 Max Turbo — faster than real time (~0.5s GPU for 5s @ 480P)
@@ -293,12 +363,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { path: `takes/${name}.glb` });
     }
 
+    // Start the local worker from its prepared Python environment on request.
+    if (req.method === 'POST' && url.pathname === '/api/hq/start') return startHqWorker(req, res);
+
     // HQ pass: forward to the local GVHMR worker (hq/worker.py).
     if (url.pathname === '/api/hq/health') {
       try {
         const r = await fetch(`${HQ_URL}/health`, { signal: AbortSignal.timeout(2000) });
         return send(res, 200, await r.json());
-      } catch { return send(res, 200, { ok: false, error: 'worker offline' }); }
+      } catch { return send(res, 200, { ok: false, error: hqLaunchError || 'worker offline' }); }
     }
     if (req.method === 'POST' && url.pathname === '/api/hq') {
       const b = await readJson(req);
@@ -357,6 +430,8 @@ const server = http.createServer(async (req, res) => {
     send(res, status, { error: err.message });
   }
 });
+
+process.once('exit', () => { if (hqProcess && hqProcess.exitCode == null) hqProcess.kill(); });
 
 server.listen(PORT, () => {
   const address = server.address();

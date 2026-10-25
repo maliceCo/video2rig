@@ -199,6 +199,10 @@
     <div class="section">
       <label class="title">motion</label>
       <label class="check"><input type="checkbox" id="hq" /><span>hq pass · gvhmr on your gpu<small>instant mediapipe preview, then the gvhmr motion swaps in</small></span></label>
+      <div id="hq-worker-controls" style="display:flex;flex-direction:column;align-items:flex-start;gap:6px">
+        <button class="btn" id="start-hq" type="button">start hq worker</button>
+        <span class="note" id="hq-worker-note">Requires the HQ environment and models; first startup can take a while.</span>
+      </div>
       <label class="check"><input type="checkbox" id="waitHq" /><span>hold playback until hq is ready<small>cleanest look, a few seconds before each clip</small></span></label>
       <label class="check"><input type="checkbox" id="hands" /><span>track fingers<small>wilor on the source clip → wrist and finger poses. untracked hands rest in a natural curl</small></span></label>
       <label class="check"><input type="checkbox" id="rootMotion" /><span>root motion</span></label>

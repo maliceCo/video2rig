@@ -83,7 +83,7 @@ download *Models & Code* (`mano_v1_2.zip`), then:
 hq\.venv\Scripts\python hq\setup_hands.py $HOME\Downloads\mano_v1_2.zip   # WiLoR weights + MANO
 ```
 
-Without MANO, fingers fall back to MediaPipe Hands (rougher depth). Then start the worker next to the web server:
+Without MANO, fingers fall back to MediaPipe Hands (rougher depth). With the web server running, click **start hq worker** under **motion** in the app. The worker needs the prepared `hq/.venv` and models above; first startup can take a few minutes. Or start it manually next to the web server:
 
 ```powershell
 hq\.venv\Scripts\python hq\worker.py    # → 127.0.0.1:5178, loads once and stays warm

@@ -349,10 +349,64 @@ async function lastFrameDataUrl(url) {
 
 // ---- HQ (GVHMR) --------------------------------------------------------------------------
 let hqOnline = false;
+let hqStarting = false;
+
+function updateHqWorkerControls() {
+  const controls = $('#hq-worker-controls');
+  if (!controls) return;
+  controls.style.display = hqOnline ? 'none' : 'flex';
+  $('#start-hq').disabled = hqStarting;
+  $('#start-hq').textContent = hqStarting ? 'starting hq worker…' : 'start hq worker';
+  $('#hq-worker-note').textContent = hqStarting
+    ? 'Loading the GPU models can take several minutes.'
+    : 'Requires hq/.venv and the HQ models; on Windows, run hq/setup.ps1 first.';
+}
+
 async function checkHQ() {
-  try { const r = await api('/api/hq/health'); hqOnline = !!r.ok; pill('hq', r.ok ? `hq · ${(r.device || 'ready').replace(/^NVIDIA GeForce /, '').toLowerCase()}` : 'hq · ' + (r.error || 'not ready'), r.ok ? 'ok' : 'bad'); }
-  catch { hqOnline = false; pill('hq', 'hq worker offline', 'bad'); }
+  let status = null;
+  try {
+    status = await api('/api/hq/health');
+    hqOnline = !!status.ok;
+    pill('hq', status.ok ? `hq · ${(status.device || 'ready').replace(/^NVIDIA GeForce /, '').toLowerCase()}` : 'hq · ' + (status.error || 'not ready'), status.ok ? 'ok' : 'bad');
+  } catch { hqOnline = false; pill('hq', 'hq worker offline', 'bad'); }
+  updateHqWorkerControls();
   renderTakes();
+  return status;
+}
+
+async function startHQWorker() {
+  if (hqStarting || hqOnline) return;
+  hqStarting = true;
+  updateHqWorkerControls();
+  log('starting HQ worker…', 'hq');
+  try {
+    const result = await api('/api/hq/start', {});
+    if (result.ok) {
+      await checkHQ();
+      log(`HQ worker ready${result.device ? ` · ${result.device}` : ''}`, 'ok');
+      return;
+    }
+    log(result.started ? 'HQ worker launched; waiting for it to load…' : 'HQ worker is already starting…', 'hq');
+    for (let i = 0; i < 180; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const status = await checkHQ();
+      if (status?.ok) {
+        log(`HQ worker ready${status.device ? ` · ${status.device}` : ''}`, 'ok');
+        return;
+      }
+      if (status?.error && status.error !== 'worker offline') {
+        log(`HQ worker could not become ready: ${status.error}`, 'err');
+        return;
+      }
+    }
+    log('HQ worker is still loading; check its status before trying again.', 'err');
+  } catch (error) {
+    log(`could not start HQ worker: ${error.message}`, 'err');
+    await checkHQ();
+  } finally {
+    hqStarting = false;
+    updateHqWorkerControls();
+  }
 }
 
 function validateHqResult(r) {
@@ -723,6 +777,7 @@ async function exportTake(take) {
 bindSetting('stream', 'checked', (on) => {
   for (const id of ['chain', 'waitHq']) { const el = $('#' + id); el.disabled = on; el.closest('label').style.opacity = on ? 0.5 : 1; }
 });
+$('#start-hq').onclick = startHQWorker;
 bindSetting('source'); bindSetting('chain', 'checked'); bindSetting('resolution');
 bindSetting('videoModel', 'value', (m) => {
   const d = $('#duration'); d.min = m === 'flux3' ? 5 : 2;  // FLUX 3 Max: 5–20s
