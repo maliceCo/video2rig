@@ -67,6 +67,8 @@ cp .env.example .env          # add your FAL_KEY
 node server.mjs               # → http://localhost:5177 (the live preview works now)
 ```
 
+For sharing a Windows test build through GitLab Releases, see [the release and setup guide](docs/PRUEBA-GITLAB.md) (`instalar.bat` / `iniciar.bat`).
+
 **HQ pass (recommended):**
 
 ```powershell
@@ -102,6 +104,12 @@ hq\.venv\Scripts\python hq\worker.py    # → 127.0.0.1:5178, loads once and sta
   motion is in while the next one generates, and short idle clips fill the gaps between prompts.
 - **Swap character every loop**, **cinematic camera**, portrait or landscape clips.
 - **↓ glb** on any take exports the skinned character with its animation, and keeps a copy plus the source clip's URL in `takes/`.
+  Export preserves the source model's bone names, including `:` in names such as `mixamorig:Hips`, without changing the
+  names Three.js uses internally. Models without a namespace keep their original names. Older exports need to be
+  re-exported from the original model to restore names that were previously stripped.
+  Static uniform scales (such as Mixamo's `0.01` centimeter-to-meter conversion) are normalized to `1,1,1` on an export-only
+  copy. Character size, skinning, and root motion stay unchanged. Unsupported custom transforms, such as non-uniform,
+  mirrored, or animated scales, retain their original transforms and produce a warning in the app log.
 
 ### Use a local video
 
@@ -133,17 +141,17 @@ node tools/capture.mjs --clip <video url> --prompt "..." --passes 2 --zoom 5.2-1
 
 ## Tests
 
-The upload and HQ proxy tests use temporary directories and a simulated worker; they do not call fal or use the GPU:
+The bone-name export tests run without browser assets. The upload and HQ proxy tests use temporary directories and a simulated worker; they do not call fal or use the GPU:
 
 ```bash
-node --test tests/upload-hq.test.mjs
+node --test tests/export-names.test.mjs tests/upload-hq.test.mjs
 ```
 
-The browser integration test also uses a simulated worker and verifies local import, stream-mode behavior, HQ retry, and GLB export. Set `P2R_BROWSER_EXECUTABLE` to a local Chrome/Edge executable path to run it:
+The browser tests verify unit-scale conversion for GLTF/FBX-style skin bindings, static meshes, morph targets, and unsupported-scale fallbacks. The full app test also uses a simulated worker and verifies local import, stream-mode behavior, HQ retry, and GLB export. It checks raw bone names, hierarchy, and unit scales, then reimports the GLB and compares animated world-space vertices and bones with the unmodified character. Set `P2R_BROWSER_EXECUTABLE` to a local Chrome/Edge executable path to run them:
 
 ```powershell
 $env:P2R_BROWSER_EXECUTABLE = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-node --test tests/upload-hq.browser.test.mjs
+node --test tests/export-scale.browser.test.mjs tests/upload-hq.browser.test.mjs
 ```
 
 ## Project layout
@@ -154,6 +162,8 @@ node --test tests/upload-hq.browser.test.mjs
 | `public/app.js` | UI, generation queue, live pose loop, playback and blending, stream mode, GLB export, capture hooks |
 | `public/stage.js` | the stage: lighting, reflective floor, contact shadows, cinematic camera |
 | `public/retarget.js` | Mixamo rig: MediaPipe landmarks → bones, SMPL rotations → bones, fingers, rig-to-rig pose copy |
+| `public/export-names.js` | preserves source bone names in exported GLB nodes without changing runtime animation bindings |
+| `public/export-scale.js` | normalizes static uniform scales on an export-only rig copy while preserving skinning and world-space motion |
 | `public/brand/` | universal-modder logos and fonts (Geist Pixel, Instrument Sans, Sometype Mono, all OFL) |
 | `hq/worker.py` | FastAPI worker around the `gvhmr` package, tuned for single-person generated clips |
 | `hq/hands.py` | finger tracking: batched WiLoR or MediaPipe, wrist assignment, camera → world, smoothing |

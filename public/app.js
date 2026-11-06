@@ -7,6 +7,8 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { FilesetResolver, PoseLandmarker, DrawingUtils } from '@mediapipe/tasks-vision';
 import { createStage } from './stage.js';
 import { HAND_LIMITS, Rig, OneEuro, Track, trackToClip, blendSnapshots, smplGlobals, aaToQuat } from './retarget.js';
+import { rememberOriginalBoneNames, originalBoneNamesPlugin } from './export-names.js';
+import { prepareUnitScaleExport } from './export-scale.js';
 
 const $ = (s) => document.querySelector(s);
 // Mixamo-rigged characters from the three.js examples (loaded from the CDN, not redistributed here).
@@ -105,6 +107,7 @@ async function loadModel(src, name) {
   const isFbx = /\.fbx$/i.test(name);
   const obj = await (isFbx ? new FBXLoader() : new GLTFLoader()).loadAsync(src);
   const root = isFbx ? obj : obj.scene;
+  rememberOriginalBoneNames(root, isFbx ? null : obj.parser);
   if (isFbx) root.scale.setScalar(0.01);         // Mixamo FBX is in centimeters
   root.updateMatrixWorld(true);
   // Retargeting assumes the character faces +Z (toward the camera); some exports face -Z.
@@ -762,7 +765,9 @@ async function exportTake(take) {
   if (!track) return;
   const name = `take${take.id}_${take.prompt.replace(/[^a-z0-9]+/gi, '_').slice(0, 40)}${take.hq ? '_hq' : '_live'}`;
   const clip = trackToClip(rig, track, name);
-  const glb = await new GLTFExporter().parseAsync(model, { binary: true, animations: [clip] });
+  const exported = prepareUnitScaleExport(model, clip);
+  if (exported.warning) log(exported.warning, 'err');
+  const glb = await new GLTFExporter().register(originalBoneNamesPlugin).parseAsync(exported.model, { binary: true, animations: [exported.clip] });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([glb], { type: 'model/gltf-binary' }));
   a.download = name + '.glb'; a.click();
